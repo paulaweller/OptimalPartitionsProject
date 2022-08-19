@@ -1,4 +1,4 @@
-using JuMP, Gurobi, LinearAlgebra
+using JuMP, Ipopt, LinearAlgebra, Dualization, Gurobi
 include("helpers.jl")
 
 
@@ -17,6 +17,8 @@ function solve_voronoi_kkt(K, inst)
 
     part_model = Model(Gurobi.Optimizer)
     set_optimizer_attribute(part_model, "NonConvex", 2)
+    # set_optimizer_attribute(part_model, "FeasibilityTol", 1e-4)
+    set_optimizer_attribute(part_model, "TimeLimit", 120)
     set_optimizer_attribute(part_model, "Presolve", 0)
     # variables ---------------------------------
 
@@ -31,15 +33,14 @@ function solve_voronoi_kkt(K, inst)
     # overall objective
     @variable(part_model, z_obj>= 0)
     # voronoi points
-    @variable(part_model, 0<=v[1:J_size,1:K]<=inst.D)
+    @variable(part_model, 0<=v[1:J_size,1:K])
 
-    # lower-level variables
+    # eliminate symmetry
+    @constraint(part_model, [k=1:K, l=vcat([1:k-1]...,[k+1:K]...)], sum( (v[i,k]-v[i,l])^2 for i in 1:J_size)>=0.1)
+
+    # uncertainty variables
     # worst-case demand scenario, one per partition k and row j
-    @variable(part_model, 0<= ξ[1:J_size,1:J_size,1:K]<=inst.D)
-    # duals
-    @variable(part_model, μ_1[1:J_size, 1:K, 1:J_size, 1:J_size]>= 0)
-    @variable(part_model, μ_2[1:J_size, 1:K]>=0)
-    @variable(part_model, μ_3[1:J_size,1:K, 1:K]>= 0)
+    @variable(part_model, 0<= ξ[1:J_size,1:K]<=inst.D)
 
 
     # upper-level constraints ----------------------
@@ -53,52 +54,39 @@ function solve_voronoi_kkt(K, inst)
     # bounded supply
     @constraint(part_model, sum(x[i] for i=1:I_size)<= inst.W)
     # demand must be satisfied
-    @constraint(part_model, [j=1:J_size, k=1:K], sum(y[i,j,k] for i=1:I_size)+s[j,k] >= ξ[j,j,k])
+    @constraint(part_model, [j=1:J_size, k=1:K], sum(y[i,j,k] for i=1:I_size)+s[j,k] >= ξ[j,k])
 
     # voronoi points can't coincide
     # TODO @constraint(part_model, [k=1:K, l=(k+1):K], ones(J_size)*(v[:,k] .- v[:,l]))
 
-    # lower-level constraints as KKT--------------------------
+    # lower-level model --------------------------
+
+    # dual variable for distance constraints for every j, k, j1, j2
+    @variable(part_model, α[1:J_size,1:K,1:J_size,1:J_size]>=0)
+
+    # dual variable for demand sum constraint
+    @variable(part_model, β[1:J_size,1:K]>=0)
+
+    # dual variable for voronoi constraints for every j,k,l
+    @variable(part_model, γ[1:J_size, 1:K, 1:K]>=0)
+
+    # dual objective equals ξ[j,k]
+    dist = reshape([norm(inst.loc_J[j1,:]-inst.loc_J[j2,:],Inf) for j1 in 1:J_size for j2 in 1:J_size],J_size,J_size)
+    @variable(part_model, v_dot[1:K,1:K]) #k,l
+    @constraint(part_model, [k=1:K, l=vcat([1:k-1]...,[k+1:K]...)], v_dot[k,l] == sum((v[j,l]-v[j,k])*(v[j,l]+v[j,k]) for j in 1:J_size))
+
+    @constraint(part_model, [j=1:J_size,k=1:K], sum(dist[j1,j2]*α[j,k,j1,j2] for j1 in 1:J_size for j2 in vcat([1:j1-1]...,[j1+1:J_size]...))
+                                            + β[j,k]*inst.pc*inst.D*J_size + sum(0.5*v_dot[k,l]*γ[j,k,l] for l in vcat([1:k-1]...,[k+1:K]...)) <= ξ[j,k])
+
+    @constraint(part_model, [j=1:J_size, k=1:K, j1=vcat([1:j-1]...,[j+1:J_size]...)], sum(α[j,k,j1,j2]-α[j,k,j2,j1] for j2 in vcat([1:j1-1]...,[j1+1:J_size]...)) 
+                                                                                +β[j,k] +sum((v[j1,l]-v[j1,k])*γ[j,k,l] for l in vcat([1:k-1]...,[k+1:K]...))>=0)
+
+    @constraint(part_model, [j=1:J_size, k=1:K], sum(α[j,k,j,j2]-α[j,k,j2,j] for j2 in vcat([1:j-1]...,[j+1:J_size]...)) 
+    +β[j,k] +sum((v[j,l]-v[j,k])*γ[j,k,l] for l in vcat([1:k-1]...,[k+1:K]...))>=1)
 
     # gradient of objective j is -1*j'th unit vector
     #f_diff = -1(1:J_size .== j)
     
-    g_1(j1, j2, ξ_1) = ξ_1[j1] - ξ_1[j2] - norm(inst.loc_J[j1,:]-inst.loc_J[j2,:],Inf)
-    g_1_diff(j1,j2) = (1:J_size.== j1) .+ -1*(1:J_size.== j2)
-
-    g_2(ξ_2) = sum(ξ_2[j] for j in 1:J_size) - inst.pc*inst.D*J_size
-    g_2_diff = ones(m)
-
-    g_3(l,k,ξ_3) = dot(v[:,l].-v[:,k],ξ_3) -0.5*dot(v[:,l].-v[:,k],v[:,l].+v[:,k])
-    g_3_diff(l,k) = v[:,l].-v[:,k]
-
-    # stationary
-    @constraint(part_model, [j=1:J_size, k=1:K], -1*(1:J_size.== j)#.+sum(μ_1[j,k,j1,j2]*g_1_diff(j1,j2) for j1=1:J_size for j2=vcat([1:j1-1]...,[j1+1:J_size]...)) 
-                                                .+ μ_2[j,k]*g_2_diff.+sum(μ_3[j,k,l]*g_3_diff(l,k) for l=vcat([1:k-1]...,[k+1:K]...)) .== 0)
-
-    # primal feasibility
-    @constraint(part_model, [j=1:J_size, k=1:K, j1=1:J_size, j2=vcat([1:j1-1]...,[j1+1:J_size]...)], g_1(j1, j2, ξ[j,:,k]) <= 0)
-    @constraint(part_model, [j=1:J_size, k=1:K], g_2(ξ[j,:,k]) <= 0)
-    @constraint(part_model, [j=1:J_size, k=1:K, l=vcat([1:k-1]...,[k+1:K]...)], g_3(l,k,ξ[j,:,k]) <= 0)
-
-    # complementary slack
-
-    @variable(part_model, g_var_1[1:J_size,1:J_size,1:J_size,1:K])
-    @constraint(part_model, [j1=1:J_size,j2=vcat([1:j1-1]...,[j1+1:J_size]...),j=1:J_size,k=1:K], g_var_1[j1,j2,j,k] == g_1(j1,j2,ξ[j,:,k]))
-    @constraint(part_model, [j1=1:J_size,j2=vcat([1:j1-1]...,[j1+1:J_size]...),j=1:J_size,k=1:K], [g_var_1[j1,j2,j,k],μ_1[j,k,j1,j2]] in SOS1())
-
-    @variable(part_model, g_var_2[1:J_size,1:K])
-    @constraint(part_model, [j=1:J_size,k=1:K], g_var_2[j,k] == g_2(ξ[j,:,k]))
-    @constraint(part_model, [j=1:J_size,k=1:K], [g_var_2[j,k],μ_2[j,k]] in SOS1())
-
-    @variable(part_model, g_var_3[1:J_size,1:K,1:K])
-    @constraint(part_model, [j=1:J_size,k=1:K,l=vcat([1:k-1]...,[k+1:K]...)], g_var_3[j,k,l] == g_3(l, k, ξ[j,:,k]))
-    @constraint(part_model, [j=1:J_size,k=1:K,l=vcat([1:k-1]...,[k+1:K]...)], [g_var_3[j,k,l],μ_3[j,k,l]] in SOS1())
-
-    # @constraint(part_model, [j=1:J_size, k=1:K], sum(μ_1[j,k,j1,j2]g_1(j1,j2,ξ[j,k,:]) for j1 in 1:J_size for j2 in 1:J_size) +
-    #                                             μ_2[j,k]g_2(ξ[j,k,:]) +
-    #                                             sum(μ_3[j,k,l]g_3(l,k,ξ[j,k,:]) for l in 1:J_size) == 0 )
-
     @objective(part_model, Min, z_obj)
 
     open("model.txt","a") do io
@@ -106,6 +94,6 @@ function solve_voronoi_kkt(K, inst)
      end
     optimize!(part_model)
 
-    return value.(v), value.(x), value.(y), value.(s), value.(ξ), value.(μ_2), value.(μ_3)
+    return value(z_obj), value.(v), value.(x), value.(y), value.(s), value.(ξ)
 end
 

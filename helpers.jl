@@ -22,7 +22,7 @@ Fields:
     plot_loc            Should the locations of service and demand points be plotted?
     loc_max             How large is the grid
 """
-function generate_instance(I_inst, J_inst, seed; demand_bound=5, cont_perc=0.5, agg_supply_bound=round(Int, cont_perc*demand_bound*J_inst), plot_loc=false, loc_max=10)
+function generate_instance(I_inst, J_inst, seed; demand_bound=5, cont_perc=0.5, agg_supply_bound=round(Int, cont_perc*demand_bound*J_inst), plot_loc=false, loc_max=5)
 
     # seed for reproducibility
     Random.seed!(seed)
